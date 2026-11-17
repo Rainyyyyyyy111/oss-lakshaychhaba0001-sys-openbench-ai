@@ -23,7 +23,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from openbench.experiments import ExperimentManager
 from openbench.html_report import CSP, _page, _table, esc, render_html
@@ -79,7 +79,7 @@ class Dashboard:
                         if reports else f"<p>No .json or .html reports in <code>{esc(self.reports_dir)}</code>.</p>")
         return _page("OpenBench dashboard", "".join(body))
 
-    def run(self, run_id: str) -> str | None:
+    def run(self, run_id: str, page: str = "1") -> str | None:
         if not RUN_ID_RE.match(run_id):
             return None
         try:
@@ -87,22 +87,35 @@ class Dashboard:
             ev = self.manager.load_evaluation(run_id)
         except (KeyError, FileNotFoundError, ValueError):
             return None
+        page_count = max(1, (len(ev.individual_results) + MAX_ITEMS_SHOWN - 1) // MAX_ITEMS_SHOWN)
+        try:
+            page_number = int(page)
+        except ValueError:
+            page_number = 1
+        if not 1 <= page_number <= page_count:
+            page_number = 1
+        start = (page_number - 1) * MAX_ITEMS_SHOWN
         meta = [["Status", rec.status], ["Model", f"{rec.model_provider}:{rec.model_name} ({rec.model_version})"],
                 ["Mock provider", fmt(rec.is_mock_provider)], ["Dataset", f"{rec.dataset_identifier} v{rec.dataset_version}"],
                 ["Dataset checksum", rec.dataset_checksum], ["Items", f"{rec.completed_items}/{rec.total_items} completed"],
                 ["Repeat group", rec.repeat_group_id or "-"], ["Created", rec.created_at], ["OpenBench version", rec.openbench_version]]
         scores = [[k, fmt(v)] for k, v in sorted((rec.aggregate_scores or {}).items())]
         items = []
-        for item in ev.individual_results[:MAX_ITEMS_SHOWN]:
+        for item in ev.individual_results[start:start + MAX_ITEMS_SHOWN]:
             metric_text = ", ".join(f"{k}={fmt(v.score)}" for k, v in sorted(item.metrics.items()))
             items.append([item.id, item.category, _short(item.prompt), _short(item.model_response), _short(item.expected_answer), metric_text])
-        more = len(ev.individual_results) - len(items)
         body = [f"<p><a href=\"/\">← all runs</a></p><h1>Run {esc(rec.run_id)}</h1>",
                 _table(["Field", "Value"], meta), "<h2>Scores</h2>", _table(["Metric", "Score"], scores, numeric={1}),
                 f"<h2>Items ({len(ev.individual_results)})</h2>",
                 _table(["ID", "Category", "Prompt", "Response", "Reference", "Metrics"], items)]
-        if more > 0:
-            body.append(f"<p class=\"meta\">{more} more item(s) not shown.</p>")
+        if page_count > 1:
+            links = []
+            if page_number > 1:
+                links.append(f'<a href="/runs/{esc(run_id)}?page={page_number - 1}">Previous</a>')
+            links.append(f"<span>Page {page_number} of {page_count}</span>")
+            if page_number < page_count:
+                links.append(f'<a href="/runs/{esc(run_id)}?page={page_number + 1}">Next</a>')
+            body.append('<nav aria-label="Item pages">' + " ".join(links) + "</nav>")
         return _page(f"Run {rec.run_id}", "".join(body))
 
     def group(self, group_id: str) -> str | None:
@@ -193,12 +206,14 @@ def make_handler(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
                 self.wfile.write(data)
 
         def _route(self, head: bool = False) -> None:
-            path = unquote(urlparse(self.path).path)
+            target = urlparse(self.path)
+            path = unquote(target.path)
             try:
                 if path in ("/", "/index.html"):
                     return self._send(200, dashboard.index(), head=head)
                 if path.startswith("/runs/"):
-                    page = dashboard.run(path[len("/runs/"):])
+                    requested_page = parse_qs(target.query, keep_blank_values=True).get("page", ["1"])[0]
+                    page = dashboard.run(path[len("/runs/"):], requested_page)
                 elif path.startswith("/groups/"):
                     page = dashboard.group(path[len("/groups/"):])
                 elif path.startswith("/reports/"):
